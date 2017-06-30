@@ -54,108 +54,112 @@ lenskit {
 
 import org.lenskit.gradle.*
 
-/* Download the MovieLens data set */
-task fetchData {
-    description 'Fetches the MovieLens data set.'
-    ext.dataDir = "data/ml-100k"
-    ext.zipFile = "data/ml-100k.zip"
+def azDir = project.findProperty('amazonDir') ?: 'data/amazon'
 
-    outputs.dir dataDir
-    outputs.file zipFile
+def azData = [
+        clothing: 'Clothing_Shoes_and_Jewelry',
+        books: 'Books',
+        music: 'Digital_Music',
+        kindle: 'Kindle_Store',
+        movies: 'Movies_and_TV',
+        video: 'Amazon_Instant_Video'
+]
 
-    doLast {
-        mkdir dataDir
-        ant {
-            get(src: 'http://files.grouplens.org/datasets/movielens/ml-100k.zip',
-                dest: zipFile,
-                skipExisting: true)
-            unzip(src: zipFile, dest: dataDir) {
-                patternset {
-                    include name: 'ml-100k/*'
-                }
-                mapper type: 'flatten'
-            }
-        }
-    }
-}
+def azSets = project.findProperty('dataSets')?.split(/,/) ?: azData.keySet()
 
-task crossfold(type: Crossfold, group: 'evaluate') {
-    // download data before evaluating
-    dependsOn fetchData
-
-    input 'data/ml-100k.yml'
-    // test on random 1/5 of each user's ratings
-    holdoutFraction(0.2, 'random')
-    // use 5-fold cross-validation
-    partitionCount 5
-}
-
-/* Run the LensKit evaluation */
 task evaluate(type: TrainTest, group: 'evaluate') {
-    description 'Runs the LensKit evaluation.'
-    logFile "$buildDir/evaluate.log"
-    logFileLevel 'DEBUG'
+    description 'Runs the LensKit evaluation for Amazon data.'
+    ext.key = "amzn"
 
-    // we add our crossfold task as evaluation input
-    dataSet crossfold
+    logFile "$buildDir/evaluate-amzn.log"
 
     // send the output to appropriate files
     outputFile "$buildDir/eval-results.csv"
-    userOutputFile "$buildDir/eval-users.csv"
+    userOutputFile "$buildDir/eval-users.csv.gz"
 
     // configure our algorithms
     algorithm 'PersMean', 'algorithms/pers-mean.groovy'
     algorithm 'ItemItem', 'algorithms/item-item.groovy'
-    algorithm 'Custom', 'algorithms/custom.groovy'
+    // algorithm 'FunkSVD', 'algorithms/funksvd.groovy'
     algorithm 'Popular', 'algorithms/popular.groovy'
+    // algorithm 'II-Pop', 'algorithms/ii-pop.groovy'
+    // algorithm 'SVD-Pop', 'algorithms/funksvd-pop.groovy'
 
-    // and some evaluation tasks and metrics
     predict {
         metric 'coverage'
         metric 'rmse'
         metric 'ndcg'
     }
     recommend {
-        listSize 10
+        listSize 100
         metric 'length'
         metric 'ndcg'
-        metric 'mrr'
         metric 'map'
+        metric 'mrr'
     }
 }
 
-task graphItemItem(type: JavaExec, group: 'debug') {
-    classpath sourceSets.main.runtimeClasspath
-
-    main 'org.lenskit.cli.Main'
-    args 'graph'
-    args '-o', "$buildDir/item-item.svg"
-    args '-t', 'svg'
-    args 'algorithms/item-item.groovy'
+task convertAmazon(group: 'preprocessing') {
+    description 'Convert Amazon data for LensKit'
 }
 
-task graphPersMean(type: JavaExec, group: 'debug') {
-    classpath sourceSets.main.runtimeClasspath
+for (d in azData) {
+    def name = d.key
+    def src = d.value
+    convertAmazon.dependsOn task("convertAmazon${name.capitalize()}", type: Exec) {
+        inputs.file "$azDir/ratings_${src}.csv"
+        inputs.file 'data/preprocess-amazon.R'
+        outputs.dir "data/az-$name"
 
-    main 'org.lenskit.cli.Main'
-    args 'graph'
-    args '-o', "$buildDir/pers-mean.svg"
-    args '-t', 'svg'
-    args 'algorithms/pers-mean.groovy'
+        executable 'Rscript'
+        args file('data/preprocess-amazon.R')
+        args file("$azDir/ratings_${src}.csv")
+        args file("data/az-$name")
+
+        doLast {
+            copy {
+                from 'data'
+                into "data/az-$name"
+                include 'amazon.yml'
+            }
+        }
+
+        // bail out early
+        onlyIf {
+            !file("data/az-$name/amazon.yml").exists()
+        }
+    }
 }
 
-task recommendItemItem(type: JavaExec, group: 'run') {
-    dependsOn fetchData
-    classpath sourceSets.main.runtimeClasspath
+task crossfoldAmazon(group: 'preprocessing') {
+    description 'Crossfold Amazon data'
+}
 
-    main 'org.lenskit.cli.Main'
-    args '--log-file', "$buildDir/item-item.log", '--log-file-level', 'debug'
-    args 'recommend'
-    args '--data-source', 'data/ml-100k.yml'
-    args '-c', 'algorithms/item-item.groovy'
+for (d in azData) {
+    def name = d.key
+    def src = d.value
+    def cft = task("crossfoldAmazon${name.capitalize()}", type: Crossfold, group: 'preprocessing') {
+        dependsOn "convertAmazon${name.capitalize()}"
+        input "data/az-$name/amazon.yml"
+        dataSetName "AMZN-$src"
+        outputDir "$buildDir/az-${name}.xf"
+        outputFormat 'gz'
+        // test on random 5 ratings for each user
+        holdout(5, 'random')
+        // use 5-fold cross-validation
+        partitionCount 5
+        // sample 2000 users per fold
+        sampleSize 2000
+        method 'sample-users'
 
-    ext.users = (project.findProperty('users') ?: '100').split(/,/)
-    args users
+        // bail out early
+        onlyIf {
+            !file("$outputDirectory/datasets.yaml").exists()
+        }
+    }
+    if (azSets.contains(name)) {
+        evaluate.dataSet cft, isolate: true
+    }
 }
 
 task analyzeResults(type: Exec, group: 'evaluate') {
